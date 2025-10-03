@@ -167,9 +167,7 @@ validate_resource_group_and_get_vms() {
         print_warning "No VMs found in resource group '$rg_name'"
         echo ""
         print_info "Resource groups with VMs:"
-        az vm list --query '[].resourceGroup' --output tsv | sort | uniq -c | while read count rg; do
-            echo "  $rg: $count VMs"
-        done
+        az vm list --query 'group_by(@, &resourceGroup)[].{resourceGroup: key, count: length(value)}' --output table
         exit 0
     fi
     
@@ -260,63 +258,6 @@ analyze_vm_distribution() {
     echo "$analysis_json"
 }
 
-# Function to associate VMs with capacity reservation group
-associate_vms_with_capacity_reservation() {
-    local rg_name="$1"
-    local crg_name="$2"
-    
-    print_info "Associating VMs with capacity reservation group '$crg_name'..."
-    
-    # Get all VMs in the resource group
-    local vm_list
-    vm_list=$(az vm list -g "$rg_name" --query '[].{name:name, zone:zones[0], size:hardwareProfile.vmSize}' -o json)
-    
-    if [[ $(echo "$vm_list" | jq '. | length') -eq 0 ]]; then
-        print_warning "No VMs found to associate"
-        return 0
-    fi
-    
-    local associated_count=0
-    local skipped_count=0
-    
-    while read -r vm_name vm_zone vm_size; do
-        if [[ -z "$vm_name" ]]; then continue; fi
-        
-        print_info "Associating VM: $vm_name (Size: $vm_size, Zone: $vm_zone)"
-        
-        # Skip VMs not in availability zones
-        if [[ "$vm_zone" == "null" || "$vm_zone" == "no-zone" ]]; then
-            print_warning "VM $vm_name is not in an availability zone, skipping association"
-            ((skipped_count++))
-            continue
-        fi
-        
-        # Update the VM to use the capacity reservation group
-        local update_output
-        update_output=$(az vm update \
-            -g "$rg_name" \
-            -n "$vm_name" \
-            --capacity-reservation-group "$crg_name" 2>&1)
-        
-        if [[ $? -eq 0 ]]; then
-            print_success "Successfully associated VM '$vm_name' with capacity reservation group"
-            ((associated_count++))
-        else
-            print_error "Failed to associate VM '$vm_name' with capacity reservation group"
-            print_error "Error details: $update_output"
-        fi
-        
-    done <<< "$(echo "$vm_list" | jq -r '.[] | "\(.name) \(.zone // "no-zone") \(.size)"')"
-    
-    echo ""
-    print_info "VM Association Summary:"
-    print_info "Successfully associated: $associated_count VMs"
-    if [[ $skipped_count -gt 0 ]]; then
-        print_warning "Skipped (not in availability zones): $skipped_count VMs"
-    fi
-    echo ""
-}
-
 # Function to create capacity reservation group
 create_capacity_reservation_group() {
     local rg_name="$1"
@@ -325,21 +266,9 @@ create_capacity_reservation_group() {
     
     print_info "Creating Capacity Reservation Group '$crg_name' in region '$region'..."
     
-    # Get the zones used by VMs in the resource group
-    local zones_used
-    zones_used=$(az vm list -g "$rg_name" --query '[].zones[0]' -o tsv 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
-    
-    if [[ -n "$zones_used" ]]; then
-        print_info "Creating capacity reservation group with zones: $zones_used"
-        local create_output
-        create_output=$(az capacity reservation group create -n "$crg_name" -g "$rg_name" -l "$region" --zones $zones_used 2>&1)
-        local exit_code=$?
-    else
-        print_info "Creating capacity reservation group (no zones)"
-        local create_output
-        create_output=$(az capacity reservation group create -n "$crg_name" -g "$rg_name" -l "$region" 2>&1)
-        local exit_code=$?
-    fi
+    local create_output
+    create_output=$(az capacity reservation group create -n "$crg_name" -g "$rg_name" -l "$region" 2>&1)
+    local exit_code=$?
     
     if [[ $exit_code -eq 0 ]]; then
         print_success "Capacity Reservation Group '$crg_name' created successfully"
@@ -382,20 +311,16 @@ create_capacity_reservations() {
         
         print_info "Creating reservation '$reservation_name' for VM size '$size' in zone '$zone' with $count instances..."
         
-        local create_output
-        create_output=$(az capacity reservation create \
+        if az capacity reservation create \
             -g "$rg_name" \
             -n "$reservation_name" \
             -c "$crg_name" \
             -s "$size" \
             --capacity "$count" \
-            -z "$zone" 2>&1)
-        
-        if [[ $? -eq 0 ]]; then
+            -z "$zone" > /dev/null 2>&1; then
             print_success "Created reservation '$reservation_name' (Size: $size, Zone: $zone, Capacity: $count)"
         else
             print_error "Failed to create reservation '$reservation_name'"
-            print_error "Error details: $create_output"
         fi
         
         ((reservation_counter++))
@@ -477,9 +402,12 @@ main() {
         exit 0
     fi
     
-    # Create analysis data directly
-    local analysis_data="["
-    local first=true
+    # Create analysis data by aggregating VMs by size and zone
+    print_info "Aggregating VMs by size and availability zone..."
+    
+    # Use associative arrays to count VMs by size+zone combination
+    declare -A vm_counts
+    declare -A size_zone_map
     
     while read -r vm_name vm_size vm_zone vm_location; do
         if [[ -z "$vm_name" ]]; then continue; fi
@@ -491,15 +419,39 @@ main() {
             continue
         fi
         
+        # Create a unique key for size+zone combination
+        local key="${vm_size}_${vm_zone}"
+        
+        # Increment count for this size+zone combination
+        if [[ -n "${vm_counts[$key]}" ]]; then
+            vm_counts[$key]=$((vm_counts[$key] + 1))
+        else
+            vm_counts[$key]=1
+            size_zone_map[$key]="${vm_size}|${vm_zone}"
+        fi
+        
+    done <<< "$(echo "$vm_info" | jq -r '.[] | "\(.name) \(.size) \(.zone // "no-zone") \(.location)"')"
+    
+    # Build analysis data from aggregated counts
+    local analysis_data="["
+    local first=true
+    
+    for key in "${!vm_counts[@]}"; do
+        local size_zone="${size_zone_map[$key]}"
+        local vm_size="${size_zone%|*}"
+        local vm_zone="${size_zone#*|}"
+        local count="${vm_counts[$key]}"
+        
+        print_info "Found $count VM(s) of size '$vm_size' in zone '$vm_zone'"
+        
         if [[ "$first" == "true" ]]; then
             first=false
         else
             analysis_data="$analysis_data,"
         fi
         
-        analysis_data="$analysis_data{\"size\":\"$vm_size\",\"zone\":\"$vm_zone\",\"count\":1,\"available_zones\":\"$vm_zone\"}"
-        
-    done <<< "$(echo "$vm_info" | jq -r '.[] | "\(.name) \(.size) \(.zone // "no-zone") \(.location)"')"
+        analysis_data="$analysis_data{\"size\":\"$vm_size\",\"zone\":\"$vm_zone\",\"count\":$count,\"available_zones\":\"$vm_zone\"}"
+    done
     
     analysis_data="$analysis_data]"
     
@@ -507,16 +459,10 @@ main() {
     create_capacity_reservation_group "$SELECTED_RG_NAME" "$SELECTED_RG_LOCATION" "$crg_name"
     create_capacity_reservations "$SELECTED_RG_NAME" "$crg_name" "$analysis_data"
     
-    # Associate VMs with the capacity reservation group
-    associate_vms_with_capacity_reservation "$SELECTED_RG_NAME" "$crg_name"
-    
     echo ""
     print_success "On-Demand Capacity Reservation creation process completed!"
     print_info "You can view your capacity reservations using:"
     print_info "az capacity reservation list -g $SELECTED_RG_NAME --capacity-reservation-group $crg_name"
-    echo ""
-    print_info "You can view VM associations using:"
-    print_info "az vm show -g $SELECTED_RG_NAME -n <vm-name> --query 'capacityReservation'"
 }
 
 # Run main function with all arguments
