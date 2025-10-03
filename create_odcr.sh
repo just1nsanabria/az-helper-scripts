@@ -260,6 +260,63 @@ analyze_vm_distribution() {
     echo "$analysis_json"
 }
 
+# Function to associate VMs with capacity reservation group
+associate_vms_with_capacity_reservation() {
+    local rg_name="$1"
+    local crg_name="$2"
+    
+    print_info "Associating VMs with capacity reservation group '$crg_name'..."
+    
+    # Get all VMs in the resource group
+    local vm_list
+    vm_list=$(az vm list -g "$rg_name" --query '[].{name:name, zone:zones[0], size:hardwareProfile.vmSize}' -o json)
+    
+    if [[ $(echo "$vm_list" | jq '. | length') -eq 0 ]]; then
+        print_warning "No VMs found to associate"
+        return 0
+    fi
+    
+    local associated_count=0
+    local skipped_count=0
+    
+    while read -r vm_name vm_zone vm_size; do
+        if [[ -z "$vm_name" ]]; then continue; fi
+        
+        print_info "Associating VM: $vm_name (Size: $vm_size, Zone: $vm_zone)"
+        
+        # Skip VMs not in availability zones
+        if [[ "$vm_zone" == "null" || "$vm_zone" == "no-zone" ]]; then
+            print_warning "VM $vm_name is not in an availability zone, skipping association"
+            ((skipped_count++))
+            continue
+        fi
+        
+        # Update the VM to use the capacity reservation group
+        local update_output
+        update_output=$(az vm update \
+            -g "$rg_name" \
+            -n "$vm_name" \
+            --capacity-reservation-group "$crg_name" 2>&1)
+        
+        if [[ $? -eq 0 ]]; then
+            print_success "Successfully associated VM '$vm_name' with capacity reservation group"
+            ((associated_count++))
+        else
+            print_error "Failed to associate VM '$vm_name' with capacity reservation group"
+            print_error "Error details: $update_output"
+        fi
+        
+    done <<< "$(echo "$vm_list" | jq -r '.[] | "\(.name) \(.zone // "no-zone") \(.size)"')"
+    
+    echo ""
+    print_info "VM Association Summary:"
+    print_info "Successfully associated: $associated_count VMs"
+    if [[ $skipped_count -gt 0 ]]; then
+        print_warning "Skipped (not in availability zones): $skipped_count VMs"
+    fi
+    echo ""
+}
+
 # Function to create capacity reservation group
 create_capacity_reservation_group() {
     local rg_name="$1"
@@ -450,10 +507,16 @@ main() {
     create_capacity_reservation_group "$SELECTED_RG_NAME" "$SELECTED_RG_LOCATION" "$crg_name"
     create_capacity_reservations "$SELECTED_RG_NAME" "$crg_name" "$analysis_data"
     
+    # Associate VMs with the capacity reservation group
+    associate_vms_with_capacity_reservation "$SELECTED_RG_NAME" "$crg_name"
+    
     echo ""
     print_success "On-Demand Capacity Reservation creation process completed!"
     print_info "You can view your capacity reservations using:"
     print_info "az capacity reservation list -g $SELECTED_RG_NAME --capacity-reservation-group $crg_name"
+    echo ""
+    print_info "You can view VM associations using:"
+    print_info "az vm show -g $SELECTED_RG_NAME -n <vm-name> --query 'capacityReservation'"
 }
 
 # Run main function with all arguments
