@@ -1,0 +1,35 @@
+
+#!/bin/bash
+
+source_sku_1="Standard_D2ds_v5"
+source_sku_2="Standard_D4ds_v5"
+target_sku="Standard_E2ds_v5"
+resource_groups=""
+
+for resource_group in "${resource_groups[@]}"; do
+    echo "Checking resource group: $resource_group"
+
+    ## VMs with matching SKUs ##
+    vm_list=$(az vm list --resource-group "$resource_group" --query "[?hardwareProfile.vmSize=='$source_sku_1' || hardwareProfile.vmSize=='$source_sku_2'].name" -o tsv)
+
+    if [ -z "$vm_list" ]; then
+        echo "No matching VMs found in $resource_group"
+        continue
+    fi
+
+    for vm_name in $vm_list; do
+        echo "Processing VM: $vm_name in $resource_group"
+
+        ## Deallocate VM ##
+        az vm deallocate --resource-group "$resource_group" --name "$vm_name"
+        az vm wait --resource-group "$resource_group" --name "$vm_name" --deallocated
+
+        ## Update VM size ##
+        az vm update --resource-group "$resource_group" --name "$vm_name" --set hardwareProfile.vmSize="$target_sku"
+
+        ## Start VM ##
+        az vm start --resource-group "$resource_group" --name "$vm_name"
+
+        echo "✅ VM $vm_name updated to $target_sku"
+    done
+done
