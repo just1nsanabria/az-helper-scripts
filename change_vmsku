@@ -1,12 +1,11 @@
-
 #!/bin/bash
 
-source_sku_1="Standard_D2ds_v5"
-source_sku_2="Standard_D4ds_v5"
-target_sku="Standard_E2ds_v5"
-resource_groups=""
+source_sku_1=""
+source_sku_2=""
+target_sku=""
+resource_group=""
 
-for resource_group in "${resource_groups[@]}"; do
+for resource_group in "${resource_group[@]}"; do
     echo "Checking resource group: $resource_group"
 
     ## VMs with matching SKUs ##
@@ -22,7 +21,6 @@ for resource_group in "${resource_groups[@]}"; do
 
         ## Deallocate VM ##
         az vm deallocate --resource-group "$resource_group" --name "$vm_name"
-        az vm wait --resource-group "$resource_group" --name "$vm_name" --deallocated
 
         ## Update VM size ##
         az vm update --resource-group "$resource_group" --name "$vm_name" --set hardwareProfile.vmSize="$target_sku"
